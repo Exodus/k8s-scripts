@@ -2,6 +2,7 @@
 # requires-python = ">=3.12"
 # dependencies = [
 #     "kubernetes",
+#     "pydantic",
 #     "rich",
 #     "tqdm",
 # ]
@@ -13,6 +14,32 @@ from rich.console import Console
 from rich.table import Table
 import math
 import re
+from pydantic import BaseModel
+
+# Pydantic models to validate metrics structure
+class ResourceUsage(BaseModel):
+    cpu: str
+    memory: str
+
+class NodeMetrics(BaseModel):
+    apiVersion: str
+    kind: str
+    metadata: dict
+    timestamp: str
+    window: str
+    usage: ResourceUsage
+
+class ContainerUsage(BaseModel):
+    name: str
+    usage: ResourceUsage
+
+class PodMetrics(BaseModel):
+    apiVersion: str
+    kind: str
+    metadata: dict
+    timestamp: str
+    window: str
+    containers: list[ContainerUsage]
 
 
 class KubernetesMemoryAnalyzer:
@@ -24,7 +51,8 @@ class KubernetesMemoryAnalyzer:
         self.metrics_api = client.CustomObjectsApi()
         self.console = Console()
 
-    def parse_memory(self, value):
+    @staticmethod
+    def parse_memory(value: str) -> int:
         """
         Parse memory usage strings like '6374M', '1024Ki', or '2G' into MiB.
         """
@@ -39,9 +67,14 @@ class KubernetesMemoryAnalyzer:
         if unit not in units:
             raise ValueError(f"Unsupported memory unit: {unit}")
 
-        return number * units[unit]
+        return int(number * units[unit])
 
-    def fetch_pods_for_controller(self, controller_kind, controller_name, namespace):
+    def fetch_pods_for_controller(
+        self, 
+        controller_kind: str, 
+        controller_name: str, 
+        namespace: str
+    ) -> list[client.V1Pod]:
         """
         Fetch all pods managed by a given controller using its label selector.
         """
@@ -73,7 +106,8 @@ class KubernetesMemoryAnalyzer:
 
         raise ValueError(f"Unsupported controller kind: {controller_kind}")
 
-    def get_controller_kind_and_name(self, pod):
+    @staticmethod
+    def get_controller_kind_and_name(pod: client.V1Pod) -> tuple[str | None, str | None]:
         """
         Identify the higher-level controller managing the pod.
         """
@@ -83,7 +117,7 @@ class KubernetesMemoryAnalyzer:
                 return owner.kind, owner.name
         return None, None
 
-    def get_memory_utilization(self, resource_type, namespace, name):
+    def get_memory_utilization(self, resource_type: str, namespace: str | None, name: str) -> int | None:
         """
         Fetch memory utilization for a given resource (node or pod).
         """
@@ -95,6 +129,9 @@ class KubernetesMemoryAnalyzer:
                     plural="nodes",
                     name=name
                 )
+                node_metrics = NodeMetrics(**metrics)
+                return self.parse_memory(node_metrics.usage.memory)
+
             elif resource_type == "pod":
                 metrics = self.metrics_api.get_namespaced_custom_object(
                     group="metrics.k8s.io",
@@ -103,18 +140,16 @@ class KubernetesMemoryAnalyzer:
                     plural="pods",
                     name=name
                 )
+                pod_metrics = PodMetrics(**metrics)
+                return sum(self.parse_memory(container.usage.memory) for container in pod_metrics.containers)
             else:
                 raise ValueError(f"Unsupported resource type: {resource_type}")
-            
-            if resource_type == "node":
-                return self.parse_memory(metrics["usage"]["memory"])
-            elif resource_type == "pod":
-                return sum(self.parse_memory(container["usage"]["memory"]) for container in metrics["containers"])
+
         except Exception as e:
             self.console.print(f"[bold red]Error fetching memory for {resource_type} {name}: {e}[/bold red]")
             return None
 
-    def analyze_nodes(self):
+    def analyze_nodes(self) -> list[str]:
         """
         Analyze memory utilization for all nodes.
         """
@@ -153,7 +188,7 @@ class KubernetesMemoryAnalyzer:
         self.console.print(node_table)
         return high_usage_nodes
 
-    def analyze_pods_on_node(self, node_name):
+    def analyze_pods_on_node(self, node_name: str) -> client.V1Pod | None:
         """
         Analyze memory utilization for all pods on a specific node.
         """
@@ -183,7 +218,7 @@ class KubernetesMemoryAnalyzer:
         self.console.print(pod_table)
         return highest_usage_pod
 
-    def analyze_controller(self, controller_kind, controller_name, namespace):
+    def analyze_controller(self, controller_kind: str, controller_name: str, namespace: str):
         """
         Analyze memory utilization for all pods managed by a controller.
         """
